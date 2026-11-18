@@ -4,7 +4,11 @@ Consistency model (single process, SQLite as the source of truth):
 
 * Upload: parquet is written to a tmp file, fsynced, atomically renamed,
   then registered ``active`` in SQLite.  A read only ever sees fully
-  registered files.
+  registered files.  Uploads may carry a client-supplied batch id: the
+  batch row (id -> day, content hash, original receipt) commits in the
+  same transaction as the file row, so a retry of a committed batch
+  replays its receipt without new bytes, a failed attempt never holds
+  the id, and the registry survives restarts.
 * Read: the active file list is snapshotted and refcounted under one lock,
   so a read always corresponds to the complete pre- or post-switch state --
   never a mix.  Retired files stay on disk until their refcount hits zero.
@@ -20,6 +24,7 @@ Consistency model (single process, SQLite as the source of truth):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -42,6 +47,10 @@ log = logging.getLogger("buoy-lake")
 
 class ConflictError(RuntimeError):
     """A compaction is already running for this day."""
+
+
+class BatchConflictError(RuntimeError):
+    """Batch id already registered with a different day or different content."""
 
 
 class NotFoundError(KeyError):
@@ -79,8 +88,23 @@ class Lake:
     # ------------------------------------------------------------------
     # uploads
     # ------------------------------------------------------------------
-    def upload(self, day: str, content: bytes) -> dict:
-        """Parse CSV, write one parquet file, register it. Raises CsvError."""
+    def upload(self, day: str, content: bytes, batch_id: str | None = None) -> dict:
+        """Parse CSV, write one parquet file, register it. Raises CsvError.
+
+        With ``batch_id`` the upload is idempotent: a retry carrying the
+        same id, the same day and byte-identical CSV content replays the
+        receipt of the first registration without writing a new parquet
+        file; the same id with a different day or different bytes raises
+        BatchConflictError.  Without an id every call appends, as before.
+        """
+        digest = hashlib.sha256(content).hexdigest() if batch_id is not None else None
+
+        if batch_id is not None:
+            existing = self._get_batch(batch_id)
+            if existing is not None:
+                # Retry fast path: no CSV parse, no file write, no new rows.
+                return self._batch_receipt(existing, day, digest)
+
         table = parse_csv(content)
         n = table.num_rows
         day_dir = self._day_dir(day)
@@ -89,20 +113,87 @@ class Lake:
         write_parquet_atomic(table, final)
         try:
             with connect(str(self.db_path)) as conn:
+                if batch_id is not None:
+                    # The PRIMARY KEY admits exactly one registration per
+                    # id, even for racing first uploads; batch row and file
+                    # row commit in one transaction, so a crash cannot
+                    # leave one without the other and a failed attempt
+                    # (parse error, write error, DB error) never holds
+                    # the id.
+                    conn.execute(
+                        "INSERT INTO upload_batches(batch_id, day, sha256, file_name, rows, created_at)"
+                        " VALUES (?, ?, ?, ?, ?, ?)",
+                        (batch_id, day, digest, final.name, n, _now_iso()),
+                    )
                 conn.execute(
                     "INSERT INTO files(day, path, kind, state, rows, created_at)"
                     " VALUES (?, ?, 'upload', 'active', ?, ?)",
                     (day, str(final), n, _now_iso()),
                 )
         except Exception:
-            final.unlink(missing_ok=True)  # never registered -> remove bytes
+            # Only the file written by *this* call is removed (unique uuid
+            # name, transaction rolled back -> never registered), so the
+            # bytes of an already committed batch can never be deleted here.
+            final.unlink(missing_ok=True)
+            if batch_id is not None:
+                existing = self._get_batch(batch_id)
+                if existing is not None:
+                    # Lost the race against a concurrent first upload of
+                    # the same id: answer from the winning registration.
+                    return self._batch_receipt(existing, day, digest)
             raise
         log.info("uploaded %s rows to %s", n, final.name)
-        return {
+        receipt = {
             "day": day,
             "file": final.name,
             "rows": n,
             "file_count": self.file_count(day),
+        }
+        if batch_id is not None:
+            receipt["batch_id"] = batch_id
+            receipt["deduplicated"] = False
+        return receipt
+
+    def _get_batch(self, batch_id: str) -> dict | None:
+        with connect(str(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT batch_id, day, sha256, file_name, rows FROM upload_batches"
+                " WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _batch_receipt(self, existing: dict, day: str, digest: str) -> dict:
+        """Replay the receipt of a registered batch, or raise BatchConflictError.
+
+        The receipt is served from the batch registry, not from the files
+        table, so it still names the original parquet file and row count
+        after compaction has reclaimed the file itself -- and replaying it
+        never re-creates the file or appends rows.
+        """
+        batch_id = existing["batch_id"]
+        if existing["day"] != day:
+            raise BatchConflictError(
+                f"batch {batch_id!r} is already registered for day {existing['day']};"
+                f" a batch id cannot be reused for day {day}"
+            )
+        if existing["sha256"] != digest:
+            raise BatchConflictError(
+                f"batch {batch_id!r} is already registered for day {day}"
+                f" with different CSV content"
+            )
+        log.info(
+            "batch %s already registered as %s; replaying original receipt",
+            batch_id,
+            existing["file_name"],
+        )
+        return {
+            "day": day,
+            "file": existing["file_name"],
+            "rows": existing["rows"],
+            "file_count": self.file_count(day),
+            "batch_id": batch_id,
+            "deduplicated": True,
         }
 
     # ------------------------------------------------------------------

@@ -1,20 +1,28 @@
 """SQLite metadata layer.
 
-Two tables:
+Three tables:
 
-* ``files``       -- registry of every parquet file that belongs to a daily
-                     partition.  ``state`` is ``active`` (visible to readers)
-                     or ``retired`` (replaced by compaction, waiting for
-                     in-flight readers to drain before the bytes are
-                     unlinked).
-* ``compactions`` -- one row per compaction job.  A partial unique index
-                     guarantees at most one ``running`` job per day, which is
-                     what lets us reject concurrent compactions for the same
-                     day atomically (even across a process restart).
+* ``files``          -- registry of every parquet file that belongs to a
+                        daily partition.  ``state`` is ``active`` (visible to
+                        readers) or ``retired`` (replaced by compaction,
+                        waiting for in-flight readers to drain before the
+                        bytes are unlinked).
+* ``compactions``    -- one row per compaction job.  A partial unique index
+                        guarantees at most one ``running`` job per day, which
+                        is what lets us reject concurrent compactions for the
+                        same day atomically (even across a process restart).
+* ``upload_batches`` -- one row per committed client upload batch, keyed by
+                        the client-supplied batch id (PRIMARY KEY, so racing
+                        first uploads of the same id register exactly once).
+                        The receipt (original file name + row count) lives
+                        here -- not in ``files`` -- so it stays valid after
+                        compaction retires and reclaims the original parquet.
 
 The compaction *switch* (retire inputs + register output + mark job done)
 happens in a single SQLite transaction, so a crash can never leave the
-registry half-switched.
+registry half-switched.  Likewise, an idempotent upload commits its batch
+row and its file row in one transaction, so a crash or a failed attempt
+can never hold a batch id without the corresponding file being registered.
 """
 
 from __future__ import annotations
@@ -48,6 +56,19 @@ CREATE TABLE IF NOT EXISTS compactions (
 -- At most one running compaction per day (enforced by the DB itself).
 CREATE UNIQUE INDEX IF NOT EXISTS ux_compactions_one_running_per_day
     ON compactions(day) WHERE status = 'running';
+
+-- Idempotent upload registry: one row per committed client batch.
+-- ``sha256`` is the hex digest of the raw CSV bytes; ``file_name``/``rows``
+-- are the receipt of the first registration and are kept even after the
+-- parquet file itself is retired and reclaimed by compaction.
+CREATE TABLE IF NOT EXISTS upload_batches (
+    batch_id   TEXT PRIMARY KEY,
+    day        TEXT NOT NULL,
+    sha256     TEXT NOT NULL,
+    file_name  TEXT NOT NULL,
+    rows       INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 

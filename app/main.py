@@ -19,16 +19,18 @@ import re
 import threading
 from contextlib import asynccontextmanager
 from datetime import date
+from typing import Annotated
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 
 from .csvio import CsvError
-from .lake import ConflictError, Lake, NotFoundError
+from .lake import BatchConflictError, ConflictError, Lake, NotFoundError
 
 log = logging.getLogger("buoy-lake")
 
 DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+BATCH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 def _valid_day(day: str) -> str:
@@ -39,6 +41,19 @@ def _valid_day(day: str) -> str:
     except ValueError:
         raise HTTPException(status_code=400, detail=f"invalid calendar day {day!r}")
     return day
+
+
+def _valid_batch_id(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    bid = raw.strip()
+    if not BATCH_ID_RE.match(bid):
+        raise HTTPException(
+            status_code=400,
+            detail="invalid batch id: use 1-128 chars from [A-Za-z0-9._:-],"
+            " starting with a letter or digit",
+        )
+    return bid
 
 
 def create_app(
@@ -99,17 +114,33 @@ def create_app(
         }
 
     @app.post("/days/{day}/upload")
-    async def upload(day: str, request: Request, file: UploadFile | None = File(None)):
-        """Append a CSV (multipart file or raw ``text/csv`` body) as one parquet."""
+    async def upload(
+        day: str,
+        request: Request,
+        file: UploadFile | None = File(None),
+        batch_id: str | None = None,
+        x_batch_id: Annotated[str | None, Header()] = None,
+    ):
+        """Append a CSV (multipart file or raw ``text/csv`` body) as one parquet.
+
+        Optional idempotency key via the ``batch_id`` query parameter or the
+        ``X-Batch-Id`` header: a retry with the same id, same day and
+        byte-identical CSV replays the first registration's receipt (no new
+        file, no new rows); the same id with a different day or different
+        content is rejected with 409.  Without an id every upload appends.
+        """
         day = _valid_day(day)
+        bid = _valid_batch_id(x_batch_id if x_batch_id is not None else batch_id)
         content = await file.read() if file is not None else await request.body()
         if not content:
             raise HTTPException(status_code=400, detail="empty CSV body")
         try:
             # parquet write + fsync are blocking -> run off the event loop
-            return await run_in_threadpool(lake(request).upload, day, content)
+            return await run_in_threadpool(lake(request).upload, day, content, bid)
         except CsvError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
+        except BatchConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
 
     @app.get("/days/{day}/records")
     def records(day: str, request: Request):
